@@ -1,0 +1,10 @@
+{
+  "mini2pAuxIp": "172.21.241.8",
+  "trackingPath": "\\\\172.21.241.8\\data\\tracking",
+  "bpodPath": "\\\\172.21.241.8\\Bpod Local",
+  "logDir": "C:\\Users\\ScanImage\\Documents\\ScanImageAutomation\\logs\\network",
+  "timeoutMinutes": 10,
+  "pollSeconds": 30,
+  "username": "",
+  "password": ""
+}

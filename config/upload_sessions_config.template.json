@@ -1,0 +1,38 @@
+﻿{
+  "method": "winscp",
+  "dataRoot": "F:\\Data\\jisooj",
+  "remoteRoot": "/data/jisooj",
+  "stateDir": "C:\\Users\\ScanImage\\Documents\\ScanImageAutomation\\state\\upload_state",
+  "stableMinutes": 10,
+  "sinceDays": 1,
+  "onlySessionDateToday": true,
+  "allowWarnings": true,
+  "requireBPod": false,
+  "strictAnimalCode": true,
+  "discord": {
+    "enabled": false,
+    "webhookUrl": "",
+    "username": "ScanImage Upload Bot"
+  },
+  "winscp": {
+    "path": "C:\\Program Files (x86)\\WinSCP\\WinSCP.com",
+    "useStoredConfig": false,
+    "openTarget": "",
+    "host": "SERVER_HOST_OR_IP",
+    "user": "USERNAME",
+    "password": "PASSWORD",
+    "hostKey": "ssh-ed25519 255 SHA256_OR_FINGERPRINT_HERE"
+  },
+  "rclone": {
+    "path": "rclone",
+    "remote": "labserver",
+    "remotePath": "/data/jisooj",
+    "extraArgs": [
+      "--transfers", "1",
+      "--checkers", "2",
+      "--retries", "5",
+      "--low-level-retries", "20"
+    ]
+  }
+}
+

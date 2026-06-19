@@ -1,0 +1,10 @@
+# Local configs may contain server names or credentials.
+config/*_config.json
+!config/*_config.template.json
+
+# Runtime logs and state.
+logs/
+state/
+
+# Local machine backups/artifacts.
+artifacts/
