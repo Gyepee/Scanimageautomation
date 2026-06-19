@@ -34,7 +34,8 @@ consolidation workflow and the intended direction for testing V3.
 
 - `C:\Users\ScanImage\Documents\ScanImageAutomation\workers\CopyWorker\external_copy_worker.ps1`
   - Personal non-MATLAB worker program.
-  - Runs external Bonsai/BPod copy in the background after V3 creates a job.
+  - Runs external Bonsai/BPod copy in the background after V3 creates an
+    internal job file under `ScanImageAutomation\state\copy_jobs`.
   - Writes `external_copy_status.json` and `external_copy_summary.txt`.
 
 - `append_session_note_prompt.m`
@@ -57,7 +58,9 @@ High-level flow:
 6. Create a session-specific folder.
 7. Move ScanImage `.tif` files.
 8. Move ScanImage AUX `.h5` file.
-9. Write `external_copy_job.json` and `external_copy_status.json`.
+9. Write an internal copy-worker job under
+   `ScanImageAutomation\state\copy_jobs` and write
+   `external_copy_status.json` in the session folder.
 10. Launch the external copy worker in the background.
 11. Return control to ScanImage/MATLAB without waiting for network copy.
 
