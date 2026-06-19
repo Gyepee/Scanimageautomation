@@ -26,6 +26,11 @@ $OnlySessionDateToday = if ($null -ne $cfg.onlySessionDateToday) { [bool]$cfg.on
 $StrictAnimalCode = if ($null -ne $cfg.strictAnimalCode) { [bool]$cfg.strictAnimalCode } else { $true }
 $Method = if ($cfg.method) { ([string]$cfg.method).ToLowerInvariant() } else { "winscp" }
 $ManualReviewRetryDays = if ($cfg.manualReviewRetryDays) { [int]$cfg.manualReviewRetryDays } else { 3 }
+$UploadExcludePatterns = if ($cfg.uploadExcludePatterns) {
+    @($cfg.uploadExcludePatterns | ForEach-Object { [string]$_ })
+} else {
+    @("external_copy_job.json", "external_copy_summary*.txt")
+}
 
 function Write-Log {
     param([string]$Message)
@@ -370,6 +375,11 @@ function Invoke-WinSCPUpload {
 
     $tmpScript = Join-Path $env:TEMP ("winscp_upload_" + [guid]::NewGuid().ToString("N") + ".txt")
     $localMask = Join-Path $Dir.FullName "*"
+    $fileMask = ""
+    if ($UploadExcludePatterns.Count -gt 0) {
+        $fileMask = "| " + ($UploadExcludePatterns -join "; ")
+    }
+
     $commands = @(
         "option batch abort",
         "option confirm off",
@@ -377,7 +387,7 @@ function Invoke-WinSCPUpload {
         "option batch continue",
         "mkdir `"$RemoteFolder`"",
         "option batch abort",
-        "put -resume -nopermissions -nopreservetime `"$localMask`" `"$RemoteFolder/`"",
+        "put -resume -nopermissions -nopreservetime -filemask=`"$fileMask`" `"$localMask`" `"$RemoteFolder/`"",
         "exit"
     )
 
@@ -405,6 +415,9 @@ function Invoke-RcloneUpload {
 
     $remoteTarget = "$remote`:$RemoteFolder"
     $rcloneArgs = @("copy", $Dir.FullName, $remoteTarget, "--create-empty-src-dirs", "--log-file", $script:TransferLog, "--log-level", "INFO")
+    foreach ($pat in $UploadExcludePatterns) {
+        $rcloneArgs += @("--exclude", $pat)
+    }
 
     if ($cfg.rclone.extraArgs) {
         foreach ($arg in $cfg.rclone.extraArgs) { $rcloneArgs += [string]$arg }
@@ -514,10 +527,20 @@ foreach ($dir in $dirs) {
 
     $flagText = if ($check.Flags -and $check.Flags.Count -gt 0) { " flags=" + (($check.Flags) -join ",") } else { "" }
     Write-Log "UPLOAD $($dir.FullName) -> $remoteFolder$flagText"
-    switch ($Method) {
-        "winscp" { Invoke-WinSCPUpload -Dir $dir -RemoteFolder $remoteFolder }
-        "rclone" { Invoke-RcloneUpload -Dir $dir -RemoteFolder $remoteFolder }
-        default { throw "Unsupported method: $Method" }
+    try {
+        switch ($Method) {
+            "winscp" { Invoke-WinSCPUpload -Dir $dir -RemoteFolder $remoteFolder }
+            "rclone" { Invoke-RcloneUpload -Dir $dir -RemoteFolder $remoteFolder }
+            default { throw "Unsupported method: $Method" }
+        }
+    }
+    catch {
+        $err = $_.Exception.Message
+        Write-Log "FAILED upload $($dir.Name): $err"
+        Send-DiscordAlert `
+            -Title "Upload failed: $($dir.Name)" `
+            -Message "Session: $($dir.Name)`nLocal: $($dir.FullName)`nRemote: $remoteFolder`nReason: $err"
+        continue
     }
 
     [ordered]@{

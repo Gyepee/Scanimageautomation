@@ -11,6 +11,10 @@
   "requireCopyStatus": true,
   "manualReviewRetryDays": 3,
   "strictAnimalCode": true,
+  "uploadExcludePatterns": [
+    "external_copy_job.json",
+    "external_copy_summary*.txt"
+  ],
   "discord": {
     "enabled": false,
     "webhookUrl": "",
