@@ -21,16 +21,27 @@ $StableMinutes = if ($cfg.stableMinutes) { [int]$cfg.stableMinutes } else { 10 }
 $SinceDays = if ($cfg.sinceDays) { [int]$cfg.sinceDays } else { 2 }
 $AllowWarnings = if ($null -ne $cfg.allowWarnings) { [bool]$cfg.allowWarnings } else { $true }
 $RequireBPod = if ($null -ne $cfg.requireBPod) { [bool]$cfg.requireBPod } else { $false }
+$RequireCopyStatus = if ($null -ne $cfg.requireCopyStatus) { [bool]$cfg.requireCopyStatus } else { $true }
 $OnlySessionDateToday = if ($null -ne $cfg.onlySessionDateToday) { [bool]$cfg.onlySessionDateToday } else { $false }
 $StrictAnimalCode = if ($null -ne $cfg.strictAnimalCode) { [bool]$cfg.strictAnimalCode } else { $true }
 $Method = if ($cfg.method) { ([string]$cfg.method).ToLowerInvariant() } else { "winscp" }
+$ManualReviewRetryDays = if ($cfg.manualReviewRetryDays) { [int]$cfg.manualReviewRetryDays } else { 3 }
 
 function Write-Log {
     param([string]$Message)
     $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $line = "[$stamp] $Message"
     Write-Host $line
-    Add-Content -Path $script:RunLog -Value $line
+    for ($i = 0; $i -lt 5; $i++) {
+        try {
+            Add-Content -Path $script:RunLog -Value $line
+            return
+        }
+        catch {
+            if ($i -eq 4) { throw }
+            Start-Sleep -Milliseconds (100 * ($i + 1))
+        }
+    }
 }
 
 function Join-RemotePath {
@@ -70,6 +81,20 @@ function Add-CodeEvidence {
 
     if (-not [string]::IsNullOrWhiteSpace($Code)) {
         [void]$Evidence.Add([ordered]@{ source = $Source; code = $Code })
+    }
+}
+
+function Get-SessionDateFromName {
+    param([string]$Name)
+
+    $m = [regex]::Match($Name, '_(\d{4}-\d{2}-\d{2})_scan')
+    if (-not $m.Success) { return $null }
+
+    try {
+        return [datetime]::ParseExact($m.Groups[1].Value, "yyyy-MM-dd", [Globalization.CultureInfo]::InvariantCulture).Date
+    }
+    catch {
+        return $null
     }
 }
 
@@ -143,13 +168,60 @@ function Send-DiscordAlert {
     }
 }
 
+function Test-ManualReviewBool {
+    param([object]$ManualReview, [string]$PropertyName)
+    return ($null -ne $ManualReview -and
+        $null -ne $ManualReview.approved_for_upload -and
+        [bool]$ManualReview.approved_for_upload -and
+        $null -ne $ManualReview.$PropertyName -and
+        [bool]$ManualReview.$PropertyName)
+}
+
+function Test-MissingPatternAllowed {
+    param([object]$ManualReview, [string]$Pattern)
+
+    if ($null -eq $ManualReview -or
+        $null -eq $ManualReview.approved_for_upload -or
+        -not [bool]$ManualReview.approved_for_upload -or
+        $null -eq $ManualReview.allow_missing_patterns) {
+        return $false
+    }
+
+    foreach ($allowed in @($ManualReview.allow_missing_patterns)) {
+        if ([string]$allowed -eq $Pattern -or $Pattern -like [string]$allowed) {
+            return $true
+        }
+    }
+    return $false
+}
+
 function Test-SessionComplete {
     param([System.IO.DirectoryInfo]$Dir)
 
     $flags = New-Object System.Collections.Generic.List[string]
     $statusJson = Join-Path $Dir.FullName "external_copy_status.json"
+    $statusData = $null
+    $manualReview = $null
+
     if (-not (Test-Path $statusJson)) {
         $flags.Add("status_missing")
+        if ($RequireCopyStatus) {
+            return @{ Ok = $false; Reason = "external_copy_status.json is missing"; Flags = @($flags) }
+        }
+    } else {
+        try {
+            $statusData = Get-Content -Path $statusJson -Raw | ConvertFrom-Json
+            if ($null -ne $statusData.manual_review -and
+                $null -ne $statusData.manual_review.approved_for_upload -and
+                [bool]$statusData.manual_review.approved_for_upload) {
+                $manualReview = $statusData.manual_review
+                $flags.Add("manual_review")
+            }
+        }
+        catch {
+            $flags.Add("status_parse_error")
+            return @{ Ok = $false; Reason = "external_copy_status.json parse error"; Flags = @($flags) }
+        }
     }
 
     $files = Get-ChildItem -Path $Dir.FullName -File -Force
@@ -165,7 +237,11 @@ function Test-SessionComplete {
 
     foreach ($pat in @("*.tif", "*.h5", "*.mp4", "*timestamps*.csv")) {
         if (-not (Get-ChildItem -Path $Dir.FullName -File -Filter $pat -ErrorAction SilentlyContinue)) {
-            return @{ Ok = $false; Reason = "missing required file pattern $pat" }
+            if (Test-MissingPatternAllowed -ManualReview $manualReview -Pattern $pat) {
+                $flags.Add("manual_review_missing_$pat")
+            } else {
+                return @{ Ok = $false; Reason = "missing required file pattern $pat"; Flags = @($flags) }
+            }
         }
     }
 
@@ -195,15 +271,22 @@ function Test-SessionComplete {
         }
     }
 
-    if (Test-Path $statusJson) {
+    if ($null -ne $statusData) {
         try {
-            $statusData = Get-Content -Path $statusJson -Raw | ConvertFrom-Json
-
-            if ($statusData.status -eq "QUEUED" -or $statusData.status -eq "RUNNING") {
-                return @{ Ok = $false; Reason = "CopyWorker status is $($statusData.status); not yet complete"; Flags = @("copy_in_progress") }
+            $copyStatus = [string]$statusData.status
+            if ($copyStatus -eq "QUEUED" -or $copyStatus -eq "RUNNING") {
+                return @{ Ok = $false; Reason = "CopyWorker status is $copyStatus; not yet complete"; Flags = @("copy_in_progress") }
+            }
+            if ($copyStatus -ne "" -and $copyStatus -ne "DONE") {
+                $flags.Add("copy_status_$copyStatus")
+                if (Test-ManualReviewBool -ManualReview $manualReview -PropertyName "allow_copy_status_failure") {
+                    $flags.Add("manual_review_copy_status_failure")
+                } else {
+                    return @{ Ok = $false; Reason = "CopyWorker status is $copyStatus"; Flags = @($flags) }
+                }
             }
 
-            # Prefer explicit top-level fields; fall back to counting from items[] (CopyWorker format)
+            # Prefer explicit top-level fields; fall back to counting from items[] (CopyWorker format).
             $statusItems = @($statusData.items)
             $failCount = if ($null -ne $statusData.fail_count) {
                 [int]$statusData.fail_count
@@ -213,8 +296,18 @@ function Test-SessionComplete {
 
             if ($failCount -gt 0) {
                 $flags.Add("status_fail_$failCount")
+                if (Test-ManualReviewBool -ManualReview $manualReview -PropertyName "allow_copy_status_failure") {
+                    $flags.Add("manual_review_copy_status_failure")
+                } else {
+                    return @{ Ok = $false; Reason = "CopyWorker reported fail_count=$failCount"; Flags = @($flags) }
+                }
             } elseif ($failCount -lt 0) {
                 $flags.Add("status_fail_count_missing")
+                if (Test-ManualReviewBool -ManualReview $manualReview -PropertyName "allow_copy_status_failure") {
+                    $flags.Add("manual_review_copy_status_failure")
+                } else {
+                    return @{ Ok = $false; Reason = "CopyWorker status missing fail_count"; Flags = @($flags) }
+                }
             }
 
             $warnCount = if ($null -ne $statusData.warn_count) {
@@ -225,14 +318,18 @@ function Test-SessionComplete {
 
             if ($warnCount -gt 0) {
                 $flags.Add("status_warn_$warnCount")
-                if (-not $AllowWarnings) {
+                if (-not $AllowWarnings -and -not (Test-ManualReviewBool -ManualReview $manualReview -PropertyName "allow_warnings")) {
                     return @{ Ok = $false; Reason = "status reports warn_count=$warnCount"; Flags = @($flags) }
+                }
+                if (-not $AllowWarnings) {
+                    $flags.Add("manual_review_warnings")
                 }
             } elseif ($warnCount -lt 0) {
                 $flags.Add("status_warn_count_missing")
             }
         } catch {
             $flags.Add("status_parse_error")
+            return @{ Ok = $false; Reason = "external_copy_status.json parse error"; Flags = @($flags) }
         }
     }
 
@@ -350,6 +447,32 @@ $dirs = Get-ChildItem -Path $DataRoot -Directory -ErrorAction Stop |
     } |
     Sort-Object LastWriteTime
 
+$manualReviewDirs = Get-ChildItem -Path $DataRoot -Directory -ErrorAction Stop |
+    Where-Object {
+        if ($_.Name -notmatch '_scan.+_sess') { return $false }
+        $sessionDate = Get-SessionDateFromName -Name $_.Name
+        if ($null -eq $sessionDate) { return $false }
+        $today = (Get-Date).Date
+        $oldestRetryDate = $today.AddDays(-1 * [Math]::Max($ManualReviewRetryDays - 1, 0))
+        if ($sessionDate -lt $oldestRetryDate -or $sessionDate -gt $today) { return $false }
+
+        $statusPath = Join-Path $_.FullName "external_copy_status.json"
+        if (-not (Test-Path $statusPath)) { return $false }
+        try {
+            $sd = Get-Content -Path $statusPath -Raw | ConvertFrom-Json
+            return ($null -ne $sd.manual_review -and
+                $null -ne $sd.manual_review.approved_for_upload -and
+                [bool]$sd.manual_review.approved_for_upload)
+        }
+        catch {
+            return $false
+        }
+    }
+
+$dirs = @($dirs + $manualReviewDirs) |
+    Sort-Object FullName -Unique |
+    Sort-Object LastWriteTime
+
 foreach ($dir in $dirs) {
     $stateFile = Join-Path $StateDir ((ConvertTo-SafeName $dir.Name) + ".uploaded.json")
     if (Test-Path $stateFile) {
@@ -373,7 +496,11 @@ foreach ($dir in $dirs) {
                 }
             } catch { }
         }
-        Send-DiscordAlert -Title "Upload waiting: $($dir.Name)" -Message $discordBody
+        if ($DryRun) {
+            Write-Log "DRYRUN would alert Discord: Upload waiting: $($dir.Name)"
+        } else {
+            Send-DiscordAlert -Title "Upload waiting: $($dir.Name)" -Message $discordBody
+        }
         continue
     }
 
@@ -402,26 +529,7 @@ foreach ($dir in $dirs) {
         source_last_write = $dir.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss")
     } | ConvertTo-Json | Set-Content -Path $stateFile -Encoding ASCII
 
-    $failFlags = @($check.Flags | Where-Object { $_ -match "^status_fail_[1-9]" })
-    if ($failFlags.Count -gt 0) {
-        $statusJsonPath = Join-Path $dir.FullName "external_copy_status.json"
-        $failDetail = "Session uploaded but CopyWorker reported failures. Check external_copy_status.json."
-        if (Test-Path $statusJsonPath) {
-            try {
-                $sd = Get-Content -Path $statusJsonPath -Raw | ConvertFrom-Json
-                $badItems = @($sd.items | Where-Object { $_.status -eq "FAIL" })
-                if ($badItems.Count -gt 0) {
-                    $failDetail = "Uploaded with $($badItems.Count) failed item(s):"
-                    foreach ($it in $badItems) { $failDetail += "`n  [$($it.status)] $($it.label) — $($it.note)" }
-                    $failDetail += "`n`nManually copy missing files before the session is considered complete."
-                }
-            } catch { }
-        }
-        Send-DiscordAlert -Title "Upload done (failures): $($dir.Name)" -Message $failDetail
-    }
-
     Write-Log "DONE $($dir.Name)"
 }
 
 Write-Log "Upload scan finished."
-

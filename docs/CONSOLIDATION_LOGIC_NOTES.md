@@ -123,6 +123,16 @@ If those files are missing or still changing, the worker records the failure in
 `external_copy_status.json` and `external_copy_summary.txt`. It does not block
 the next ScanImage session.
 
+The upload automation uses `external_copy_status.json` as the upload gate. A
+session is held back and reported to Discord if the status is missing when
+required, still `QUEUED`/`RUNNING`, not `DONE`, has a nonzero `fail_count`, or
+has warnings while warnings are not allowed.
+
+If the operator manually reviews a held session, the approval is recorded inside
+`external_copy_status.json` under `manual_review`. Reviewed sessions are scanned
+again for up to `manualReviewRetryDays` days, default 3, so no extra marker files
+are needed in the session folder and old sessions do not stay in the retry pool.
+
 ## Stability Logic
 
 V3 currently uses simple file-size stability for local ScanImage files. The

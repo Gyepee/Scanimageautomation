@@ -8,6 +8,8 @@
   "onlySessionDateToday": true,
   "allowWarnings": true,
   "requireBPod": false,
+  "requireCopyStatus": true,
+  "manualReviewRetryDays": 3,
   "strictAnimalCode": true,
   "discord": {
     "enabled": false,
