@@ -33,6 +33,34 @@ function Get-ScanId {
     return ""
 }
 
+function Get-SessionDateFromName {
+    param([string]$Text)
+    $m = [regex]::Match($Text, "_(\d{4}-\d{2}-\d{2})_scan")
+    if (-not $m.Success) { return $null }
+    try {
+        return [datetime]::ParseExact($m.Groups[1].Value, "yyyy-MM-dd", [Globalization.CultureInfo]::InvariantCulture).Date
+    } catch {
+        return $null
+    }
+}
+
+function Get-BonsaiToken {
+    param([string]$Name)
+    $m = [regex]::Match($Name, "\d{4}-\d{2}-\d{2}T\d{2}_\d{2}_\d{2}")
+    if ($m.Success) { return $m.Value }
+    return ""
+}
+
+function Get-BonsaiTokenDate {
+    param([string]$Token)
+    if ([string]::IsNullOrWhiteSpace($Token) -or $Token.Length -lt 10) { return $null }
+    try {
+        return [datetime]::ParseExact($Token.Substring(0, 10), "yyyy-MM-dd", [Globalization.CultureInfo]::InvariantCulture).Date
+    } catch {
+        return $null
+    }
+}
+
 function Add-CheckItem {
     param(
         [System.Collections.ArrayList]$Items,
@@ -106,6 +134,29 @@ function Compare-TimeToReference {
     return [pscustomobject]@{ Ok = ($diff -le $LimitMin); DiffMin = $diff }
 }
 
+function Select-TrackingVideoForCsv {
+    param(
+        [string]$Root,
+        [System.IO.FileInfo]$CsvFile,
+        [string]$ScanId = ""
+    )
+
+    if ($null -eq $CsvFile) { return $null }
+    $token = Get-BonsaiToken $CsvFile.Name
+    if ([string]::IsNullOrWhiteSpace($token)) { return $null }
+
+    $files = @(Get-ChildItem -LiteralPath $Root -File -Filter "*.mp4" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like "*$token*" })
+
+    if (-not [string]::IsNullOrWhiteSpace($ScanId)) {
+        $scanFiles = @($files | Where-Object { $_.Name -like "*scan$ScanId*" -or $_.Name -like "*$ScanId*" })
+        if ($scanFiles.Count -gt 0) { $files = $scanFiles }
+    }
+
+    if ($files.Count -eq 0) { return $null }
+    return ($files | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+}
+
 function Load-DiscordFromConfig {
     $cfgPath = Join-Path $PSScriptRoot "..\..\config\upload_sessions_config.json"
     $script:DiscordWebhookUrl = ""
@@ -138,6 +189,7 @@ $items = New-Object System.Collections.ArrayList
 $sessionName = $sessionDir.Name
 $animalCode = Get-AnimalCode $sessionName
 $scanId = Get-ScanId $sessionName
+$sessionDate = Get-SessionDateFromName $sessionName
 $statusPath = Join-Path $sessionDir.FullName "external_copy_status.json"
 
 $imagingRef = Select-NewestFile -Root $sessionDir.FullName -Patterns @("*.tif", "*.h5")
@@ -147,9 +199,40 @@ if ($null -eq $imagingRef) {
     Add-CheckItem -Items $items -Label "ScanImage imaging reference" -Pattern "*.tif/*.h5" -Status "OK" -Note "Using newest imaging file as timing reference." -Src $imagingRef.FullName
 }
 
+$trackingCsv = Select-ExpectedFile -Root $sessionDir.FullName -Pattern "*timestamps*.csv" -ScanId $scanId
+if ($null -eq $trackingCsv) {
+    Add-CheckItem -Items $items -Label "Tracking timestamps (.csv)" -Pattern "*timestamps*.csv" -Status "FAIL" -Note "Required file missing."
+    Add-CheckItem -Items $items -Label "Tracking video (.mp4)" -Pattern "*.mp4" -Status "FAIL" -Note "No timestamp CSV was available to identify the matching Bonsai mp4."
+} else {
+    $token = Get-BonsaiToken $trackingCsv.Name
+    $tokenDate = Get-BonsaiTokenDate $token
+    if ([string]::IsNullOrWhiteSpace($token)) {
+        Add-CheckItem -Items $items -Label "Tracking timestamps (.csv)" -Pattern "*timestamps*.csv" -Status "FAIL" -Note "No Bonsai timestamp token found in CSV filename." -Src $trackingCsv.FullName
+    } elseif ($null -ne $sessionDate -and $null -ne $tokenDate -and $tokenDate -ne $sessionDate) {
+        Add-CheckItem -Items $items -Label "Tracking timestamps (.csv)" -Pattern "*timestamps*.csv" -Status "FAIL" -Note "Bonsai token date $($tokenDate.ToString('yyyy-MM-dd')) does not match session date $($sessionDate.ToString('yyyy-MM-dd'))." -Src $trackingCsv.FullName
+    } else {
+        $csvNote = "Present; Bonsai token $token matches session date."
+        $csvDiff = -1
+        if ($null -ne $imagingRef) {
+            $cmp = Compare-TimeToReference -File $trackingCsv -Reference $imagingRef -LimitMin ([double]$MaxTrackingImagingDiffMin)
+            $csvDiff = $cmp.DiffMin
+            $csvNote += (" CSV LastWriteTime is {0:n1} min from imaging reference." -f $cmp.DiffMin)
+        }
+        Add-CheckItem -Items $items -Label "Tracking timestamps (.csv)" -Pattern "*timestamps*.csv" -Status "OK" `
+            -Note $csvNote -Src $trackingCsv.FullName -Dst $(if ($imagingRef) { $imagingRef.FullName } else { "" }) -TimeDiffMin $csvDiff
+    }
+
+    $trackingVideo = Select-TrackingVideoForCsv -Root $sessionDir.FullName -CsvFile $trackingCsv -ScanId $scanId
+    if ($null -eq $trackingVideo) {
+        Add-CheckItem -Items $items -Label "Tracking video (.mp4)" -Pattern "*.mp4" -Status "FAIL" -Note "No paired mp4 found with the same Bonsai timestamp token as the CSV." -Src $trackingCsv.FullName
+    } else {
+        Add-CheckItem -Items $items -Label "Tracking video (.mp4)" -Pattern "*.mp4" -Status "OK" `
+            -Note "Present and paired to timestamp CSV by Bonsai token $token; mp4 LastWriteTime is ignored because post-session merging can update it." `
+            -Src $trackingVideo.FullName -Dst $trackingCsv.FullName
+    }
+}
+
 $requiredSpecs = @(
-    @{ Label = "Tracking video (.mp4)"; Pattern = "*.mp4"; TimingLimit = $MaxTrackingImagingDiffMin },
-    @{ Label = "Tracking timestamps (.csv)"; Pattern = "*timestamps*.csv"; TimingLimit = $MaxTrackingImagingDiffMin },
     @{ Label = "BPod session (.mat)"; Pattern = "*.mat"; TimingLimit = $MaxBpodImagingDiffMin },
     @{ Label = "BPod session summary (.txt)"; Pattern = "*SessionSummary.txt"; TimingLimit = $MaxBpodImagingDiffMin },
     @{ Label = "BPod session summary (.csv)"; Pattern = "*SessionSummary.csv"; TimingLimit = $MaxBpodImagingDiffMin }

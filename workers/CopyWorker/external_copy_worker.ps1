@@ -263,6 +263,60 @@ function Select-BpodCompanion {
     return Select-SameDayClosest -Root $Root -Pattern $FallbackPattern -SessionTime $SessionTime
 }
 
+function Get-BonsaiToken {
+    param([string]$Name)
+    $m = [regex]::Match($Name, "\d{4}-\d{2}-\d{2}T\d{2}_\d{2}_\d{2}")
+    if ($m.Success) { return $m.Value }
+    return ""
+}
+
+function Select-TrackingPair {
+    param(
+        [string]$Root,
+        [datetime]$SessionTime
+    )
+
+    $csvSel = Select-SameDayClosest -Root $Root -Pattern "mini2p2_top_video_timestamps*.csv" -SessionTime $SessionTime
+    if ($null -eq $csvSel.File) {
+        return [pscustomobject]@{
+            Video = $null
+            Csv = $null
+            Token = ""
+            Detail = $csvSel.Detail
+        }
+    }
+
+    $token = Get-BonsaiToken $csvSel.File.Name
+    if ([string]::IsNullOrWhiteSpace($token)) {
+        return [pscustomobject]@{
+            Video = $null
+            Csv = $csvSel.File
+            Token = ""
+            Detail = "timestamp CSV selected, but no Bonsai timestamp token was found in its filename"
+        }
+    }
+
+    $videos = @(Get-ChildItem -LiteralPath $Root -Filter "mini2p2_top_video*.mp4" -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like "*$token*" })
+
+    if ($videos.Count -eq 0) {
+        return [pscustomobject]@{
+            Video = $null
+            Csv = $csvSel.File
+            Token = $token
+            Detail = "timestamp CSV selected, but no paired mp4 with Bonsai token $token was found"
+        }
+    }
+
+    $video = $videos | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    return [pscustomobject]@{
+        Video = $video
+        Csv = $csvSel.File
+        Token = $token
+        Detail = "selected paired Bonsai tracking files by timestamp token $token"
+    }
+}
+
 . (Join-Path $PSScriptRoot "..\..\scripts\discord\Send-DiscordAlert.ps1")
 
 $script:DiscordWebhookUrl = ""
@@ -377,30 +431,27 @@ try {
         if ($pathAnimalLabel -ne "") { $job.animalID = $pathAnimalLabel }
     }
 
-    foreach ($spec in @(
-        @{ Label = "Tracking video (.mp4)"; Pattern = "mini2p2_top_video*.mp4" },
-        @{ Label = "Tracking timestamps (.csv)"; Pattern = "mini2p2_top_video_timestamps*.csv" }
-    )) {
-        $sel = Select-SameDayClosest -Root $job.tracking_root -Pattern $spec.Pattern -SessionTime $sessionTime
-        if ($null -eq $sel.File) {
-            Add-Item -Label $spec.Label -Pattern $spec.Pattern -Status "FAIL" -Note $sel.Detail
-            continue
-        }
+    $trackingPair = Select-TrackingPair -Root $job.tracking_root -SessionTime $sessionTime
+    if ($null -eq $trackingPair.Csv) {
+        Add-Item -Label "Tracking timestamps (.csv)" -Pattern "mini2p2_top_video_timestamps*.csv" -Status "FAIL" -Note $trackingPair.Detail
+        Add-Item -Label "Tracking video (.mp4)" -Pattern "mini2p2_top_video*.mp4" -Status "FAIL" -Note "No timestamp CSV was available to identify the matching Bonsai mp4."
+    } elseif ($null -eq $trackingPair.Video) {
+        Add-Item -Label "Tracking timestamps (.csv)" -Pattern "mini2p2_top_video_timestamps*.csv" -Status "OK" -Note $trackingPair.Detail -Src $trackingPair.Csv.FullName
+        Add-Item -Label "Tracking video (.mp4)" -Pattern "mini2p2_top_video*.mp4" -Status "FAIL" -Note $trackingPair.Detail
+    } else {
+        foreach ($pairItem in @(
+            @{ Label = "Tracking video (.mp4)"; Pattern = "mini2p2_top_video*.mp4"; File = $trackingPair.Video },
+            @{ Label = "Tracking timestamps (.csv)"; Pattern = "mini2p2_top_video_timestamps*.csv"; File = $trackingPair.Csv }
+        )) {
+            if (!(Wait-Stable -Path $pairItem.File.FullName -StableSec ([double]$job.externalStableSec) -TimeoutSec ([double]$job.externalSettleTimeoutSec))) {
+                Add-Item -Label $pairItem.Label -Pattern $pairItem.Pattern -Status "FAIL" -Note "file did not become size-stable before timeout" -Src $pairItem.File.FullName
+                continue
+            }
 
-        if (!(Wait-Stable -Path $sel.File.FullName -StableSec ([double]$job.externalStableSec) -TimeoutSec ([double]$job.externalSettleTimeoutSec))) {
-            Add-Item -Label $spec.Label -Pattern $spec.Pattern -Status "FAIL" -Note "file did not become size-stable before timeout" -Src $sel.File.FullName
-            continue
-        }
-
-        $dst = Copy-WithPrefix -File $sel.File -ExperimentID $exp -Dest $dest
-        $tDiff = [math]::Abs(($sel.File.LastWriteTime - $sessionTime).TotalMinutes)
-        if ($tDiff -gt $timeDiffWarnMin) {
-            Add-Item -Label $spec.Label -Pattern $spec.Pattern -Status "WARN" `
-                -Note ("{0}; {1:n1} min from session time - review required" -f $sel.Detail, $tDiff) `
-                -Src $sel.File.FullName -Dst $dst -TimeDiffMin $tDiff
-        } else {
-            Add-Item -Label $spec.Label -Pattern $spec.Pattern -Status "OK" `
-                -Note $sel.Detail -Src $sel.File.FullName -Dst $dst -TimeDiffMin $tDiff
+            $dst = Copy-WithPrefix -File $pairItem.File -ExperimentID $exp -Dest $dest
+            Add-Item -Label $pairItem.Label -Pattern $pairItem.Pattern -Status "OK" `
+                -Note ($trackingPair.Detail + "; mp4 LastWriteTime is ignored because post-session merging can update it") `
+                -Src $pairItem.File.FullName -Dst $dst
         }
     }
 
