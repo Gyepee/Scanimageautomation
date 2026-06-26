@@ -39,7 +39,7 @@ function Write-Log {
     Write-Host $line
     for ($i = 0; $i -lt 5; $i++) {
         try {
-            Add-Content -Path $script:RunLog -Value $line
+            Add-Content -LiteralPath $script:RunLog -Value $line -ErrorAction Stop
             return
         }
         catch {
@@ -135,10 +135,14 @@ function Test-AnimalCodeConsistency {
                 Add-CodeEvidence -Evidence $evidence -Source "status:animal_code" -Code $statusData.animal_code
             } elseif ($statusData.destination) {
                 Add-CodeEvidence -Evidence $evidence -Source "status:destination" -Code (Get-RosCode $statusData.destination)
-            } else {
-                $firstDst = @($statusData.items) | Where-Object { $_.dst } | Select-Object -First 1
-                if ($firstDst) {
-                    Add-CodeEvidence -Evidence $evidence -Source "status:items_dst" -Code (Get-RosCode ([string]$firstDst.dst))
+            }
+
+            foreach ($item in @($statusData.items)) {
+                if ($item.src) {
+                    Add-CodeEvidence -Evidence $evidence -Source ("status:src:" + (Split-Path ([string]$item.src) -Leaf)) -Code (Get-RosCode ([string]$item.src))
+                }
+                if ($item.dst) {
+                    Add-CodeEvidence -Evidence $evidence -Source ("status:dst:" + (Split-Path ([string]$item.dst) -Leaf)) -Code (Get-RosCode ([string]$item.dst))
                 }
             }
         } catch { }
@@ -234,7 +238,16 @@ function Test-SessionComplete {
         return @{ Ok = $false; Reason = "folder contains no files" }
     }
 
-    $newestWrite = ($files | Sort-Object LastWriteTime -Descending | Select-Object -First 1).LastWriteTime
+    $dataFiles = @($files | Where-Object {
+        $_.Name -ne "external_copy_status.json" -and
+        $_.Name -ne "external_copy_job.json" -and
+        $_.Name -notlike "external_copy_summary*.txt"
+    })
+    if (-not $dataFiles) {
+        return @{ Ok = $false; Reason = "folder contains no data files" }
+    }
+
+    $newestWrite = ($dataFiles | Sort-Object LastWriteTime -Descending | Select-Object -First 1).LastWriteTime
     $ageMin = ((Get-Date) - $newestWrite).TotalMinutes
     if ($ageMin -lt $StableMinutes) {
         return @{ Ok = $false; Reason = ("not stable yet; newest file age {0:N1} min" -f $ageMin) }
@@ -293,6 +306,13 @@ function Test-SessionComplete {
 
             # Prefer explicit top-level fields; fall back to counting from items[] (CopyWorker format).
             $statusItems = @($statusData.items)
+            if ($statusItems.Count -eq 0 -and
+                $null -eq $statusData.verifier -and
+                -not (Test-ManualReviewBool -ManualReview $manualReview -PropertyName "allow_copy_status_failure")) {
+                $flags.Add("status_items_missing")
+                return @{ Ok = $false; Reason = "CopyWorker status has no item evidence"; Flags = @($flags) }
+            }
+
             $failCount = if ($null -ne $statusData.fail_count) {
                 [int]$statusData.fail_count
             } elseif ($statusItems.Count -gt 0) {
@@ -505,7 +525,7 @@ foreach ($dir in $dirs) {
                 $badItems = @($sd.items | Where-Object { $_.status -eq "FAIL" })
                 if ($badItems.Count -gt 0) {
                     $discordBody += "`n`nFailed items:"
-                    foreach ($it in $badItems) { $discordBody += "`n  [$($it.status)] $($it.label) — $($it.note)" }
+                    foreach ($it in $badItems) { $discordBody += "`n  [$($it.status)] $($it.label) - $($it.note)" }
                 }
             } catch { }
         }
