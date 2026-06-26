@@ -1,91 +1,95 @@
 # ScanImageAutomation
 
-PowerShell automation for ScanImage-adjacent workflows.
+Operational PowerShell automation for ScanImage session cleanup, external file
+copying, upload gating, and Discord notifications.
 
-This project intentionally stays separate from `MATLAB\UserFunction`:
+This repository intentionally tracks only reusable code and templates. Runtime
+state, logs, machine-specific configs, and backups are ignored by git.
 
-- `MATLAB\UserFunction`: MATLAB user functions called directly by ScanImage.
-- `ScanImageAutomation`: upload automation, Discord notifications, background workers, scheduled-task installers, logs, docs, and operational scripts.
+## Active Automations
 
-## Important Paths
+- `ScanImageCompletedSessionUpload`
+  - Runs daily at 20:00.
+  - Calls `scripts\upload\upload_completed_sessions_from_config.ps1`.
+  - Uploads complete session folders after local validation.
 
-- Upload script: `scripts\upload\upload_completed_sessions_from_config.ps1`
-- Upload task installer: `scripts\upload\install_session_upload_task_from_config.ps1`
-- Discord helper: `scripts\discord\Send-DiscordAlert.ps1`
-- Copy worker: `workers\CopyWorker\external_copy_worker.ps1`
-- Upload config: `config\upload_sessions_config.json`
-- Upload config template: `config\upload_sessions_config.template.json`
+- `ScanImageCopySourceNetworkCheck`
+  - Runs daily at 00:00.
+  - Calls `scripts\network\check_copy_sources.ps1`.
+  - Checks access to the Mini2P auxiliary tracking and BPod shares.
 
-Runtime logs, state files, local configs, and generated artifacts are ignored by git.
+- `workers\CopyWorker\external_copy_worker.ps1`
+  - Launched by the ScanImage/MATLAB consolidation user function through job
+    files under `state\copy_jobs`.
+  - Copies tracking, BPod session outputs, and protocol backups.
+  - Writes `external_copy_status.json` into each session folder.
 
-## Dry-Run Tests
+## Core Files
 
-Use the 2026-06-18 data as a non-uploading regression set:
+- `workers\CopyWorker\external_copy_worker.ps1`
+  - External copy worker.
+  - Guards BPod `.mat` timing against the ScanImage `.tif/.h5` reference.
+  - Keeps BPod summary `.txt/.csv` paired to the selected `.mat`.
+
+- `scripts\upload\upload_completed_sessions_from_config.ps1`
+  - Upload gate and transfer runner.
+  - Requires expected imaging, tracking, and copy status evidence before upload.
+  - Ignores metadata files when checking folder stability.
+
+- `scripts\upload\verify_session_folder_for_upload.ps1`
+  - Manual repair helper.
+  - Re-checks a session folder after files are manually fixed and can rewrite
+    `external_copy_status.json` with `-UpdateStatus`.
+
+- `scripts\upload\set_upload_manual_review.ps1`
+  - Exception helper.
+  - Records a manual approval in `external_copy_status.json` when an upload
+    should proceed despite a known allowed issue.
+
+- `scripts\network\check_copy_sources.ps1`
+  - Verifies the tracking and BPod network shares.
+
+- `scripts\discord\Send-DiscordAlert.ps1`
+  - Shared Discord webhook sender.
+
+## Local Configs
+
+Copy these templates to machine-local config files and fill them in locally:
+
+- `config\upload_sessions_config.template.json`
+- `config\copy_sources_config.template.json`
+
+The real config files are intentionally ignored:
+
+- `config\upload_sessions_config.json`
+- `config\copy_sources_config.json`
+
+## Useful Commands
+
+Dry-run upload screening:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File "C:\Users\ScanImage\Documents\ScanImageAutomation\scripts\upload\upload_completed_sessions_from_config.ps1" `
-  -SessionDate 2026-06-18 `
   -DryRun
 ```
 
-Use today's routine filter:
+Verify a manually repaired session and rewrite its status:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass `
-  -File "C:\Users\ScanImage\Documents\ScanImageAutomation\scripts\upload\upload_completed_sessions_from_config.ps1" `
-  -DryRun
+  -File "C:\Users\ScanImage\Documents\ScanImageAutomation\scripts\upload\verify_session_folder_for_upload.ps1" `
+  -SessionPath "F:\Data\jisooj\SESSION_FOLDER_NAME" `
+  -UpdateStatus
 ```
 
-Install or refresh the daily upload task:
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass `
-  -File "C:\Users\ScanImage\Documents\ScanImageAutomation\scripts\upload\install_session_upload_task_from_config.ps1"
-```
-
-## Upload Screening
-
-Before uploading, `upload_completed_sessions_from_config.ps1` checks each
-session folder and its `external_copy_status.json`.
-
-Normal upload requires:
-
-- Required local files exist: `.tif`, `.h5`, tracking `.mp4`, and timestamp `.csv`
-- Major data files are non-empty
-- The folder is stable for `stableMinutes`
-- Animal code evidence is consistent when `strictAnimalCode` is enabled
-- `external_copy_status.json` exists when `requireCopyStatus` is enabled
-- CopyWorker status is `DONE`
-- CopyWorker `fail_count` is `0`
-- CopyWorker warnings are allowed only when `allowWarnings` is enabled
-
-If a session fails screening, upload is skipped and a Discord alert is sent when
-Discord is enabled in `config\upload_sessions_config.json`.
-
-Manual review is stored inside the same `external_copy_status.json`; no extra
-marker file is required in the session folder. A reviewed session is included in
-future upload scans for up to `manualReviewRetryDays` days, default 3, so old
-sessions do not stay in the retry pool forever.
-
-Approve a session after checking a CopyWorker failure:
+Approve a reviewed exception:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File "C:\Users\ScanImage\Documents\ScanImageAutomation\scripts\upload\set_upload_manual_review.ps1" `
   -SessionPath "F:\Data\jisooj\SESSION_FOLDER_NAME" `
   -ReviewedBy "jisoo" `
-  -Note "Checked manually; missing BPod summary is acceptable." `
+  -Note "Checked manually; allowed exception." `
   -AllowCopyStatusFailure
-```
-
-Approve a session while explicitly allowing a missing pattern:
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass `
-  -File "C:\Users\ScanImage\Documents\ScanImageAutomation\scripts\upload\set_upload_manual_review.ps1" `
-  -SessionPath "F:\Data\jisooj\SESSION_FOLDER_NAME" `
-  -ReviewedBy "jisoo" `
-  -Note "Tracking timestamps intentionally unavailable." `
-  -AllowMissingPatterns "*timestamps*.csv"
 ```
