@@ -396,6 +396,61 @@ function Select-BpodSessionFolder {
     }
 }
 
+function Update-CollectionManifestBehavior {
+    param(
+        [string]$Dest,
+        [string]$BehaviorType
+    )
+
+    $manifestPath = Join-Path $Dest "collection_manifest.json"
+    if (!(Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        Write-Host "[WARN] Collection manifest not found; behavior type was not recorded: $manifestPath"
+        return
+    }
+
+    try {
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+        if ($null -eq $manifest.PSObject.Properties["behavior_protocol"]) {
+            $manifest | Add-Member -NotePropertyName behavior_protocol -NotePropertyValue $BehaviorType
+        } else {
+            $manifest.behavior_protocol = $BehaviorType
+        }
+        $tmpPath = "$manifestPath.tmp"
+        $manifest | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $tmpPath -Encoding UTF8
+        Move-Item -LiteralPath $tmpPath -Destination $manifestPath -Force
+        Write-Host "[OK] Collection manifest behavior type: $BehaviorType"
+    } catch {
+        Write-Host "[WARN] Could not update collection manifest behavior metadata: $_"
+    }
+}
+
+function Finalize-CollectionManifest {
+    param([string]$Dest)
+
+    $manifestPath = Join-Path $Dest "collection_manifest.json"
+    if (!(Test-Path -LiteralPath $manifestPath -PathType Leaf)) { return }
+    try {
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+        $files = @(Get-ChildItem -LiteralPath $Dest -File | Where-Object {
+            $_.Name -notin @("collection_manifest.json", "external_copy_status.json")
+        } | Sort-Object Name | ForEach-Object {
+            [ordered]@{
+                name = $_.Name
+                bytes = $_.Length
+            }
+        })
+        $manifest.collected_files = $files
+        $manifest.collection_status = "finalized"
+        $manifest.finalized_at = NowStamp
+        $tmpPath = "$manifestPath.tmp"
+        $manifest | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $tmpPath -Encoding UTF8
+        Move-Item -LiteralPath $tmpPath -Destination $manifestPath -Force
+        Write-Host "[OK] Collection manifest finalized with $($files.Count) files"
+    } catch {
+        Write-Host "[WARN] Could not finalize collection manifest: $_"
+    }
+}
+
 try {
     if (!(Test-Path -LiteralPath $JobPath -PathType Leaf)) {
         throw "Job file not found: $JobPath"
@@ -550,9 +605,15 @@ try {
             } else {
                 Add-Item -Label "BPod protocol backup (.m)" -Pattern "*.m" -Status "SKIP" -Note "No protocol backup found"
             }
+
+            $behaviorType = $bpodSel.Folder.Parent.Name
+            Update-CollectionManifestBehavior -Dest $dest `
+                -BehaviorType $behaviorType
             }
         }
     }
+
+    Finalize-CollectionManifest -Dest $dest
 
     $fail = @($script:Items | Where-Object status -eq "FAIL").Count
     $warnItems = @($script:Items | Where-Object { $_.status -eq "WARN" -and $null -ne $_.time_diff_min })
