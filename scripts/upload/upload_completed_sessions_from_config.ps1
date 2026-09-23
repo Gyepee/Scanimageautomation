@@ -16,6 +16,9 @@ $cfg = Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json
 
 $DataRoot = if ($cfg.dataRoot) { [string]$cfg.dataRoot } else { "F:\Data\jisooj" }
 $RemoteRoot = if ($cfg.remoteRoot) { [string]$cfg.remoteRoot } else { "/data/jisooj" }
+$QcUploadEnabled = if ($null -ne $cfg.qcUploadEnabled) { [bool]$cfg.qcUploadEnabled } else { $false }
+$QcRoot = if ($cfg.qcRoot) { [string]$cfg.qcRoot } else { Join-Path $DataRoot "QC" }
+$QcRemoteSubdir = if ($cfg.qcRemoteSubdir) { [string]$cfg.qcRemoteSubdir } else { "QC" }
 $StateDir = if ($cfg.stateDir) { [string]$cfg.stateDir } else { "C:\Users\ScanImage\Documents\ScanImageAutomation\state\upload_state" }
 $StableMinutes = if ($cfg.stableMinutes) { [int]$cfg.stableMinutes } else { 10 }
 $SinceDays = if ($cfg.sinceDays) { [int]$cfg.sinceDays } else { 2 }
@@ -169,7 +172,7 @@ function Send-DiscordAlert {
     if (-not $enabled -or [string]::IsNullOrWhiteSpace($webhookUrl)) { return }
 
     try {
-        $username = if ($cfg.discord.username) { [string]$cfg.discord.username } else { "ScanImage Upload Bot" }
+        $username = if ($cfg.discord.uploadUsername) { [string]$cfg.discord.uploadUsername } else { "ScanImage Upload Bot" }
         Invoke-DiscordWebhook -WebhookUrl $webhookUrl -Title $Title -Message $Message -Username $username
     }
     catch {
@@ -361,6 +364,125 @@ function Test-SessionComplete {
     return @{ Ok = $true; Reason = "complete"; Flags = @($flags) }
 }
 
+function Test-QCSessionComplete {
+    param([System.IO.DirectoryInfo]$Dir)
+
+    $manifestPath = Join-Path $Dir.FullName "collection_manifest.json"
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        return @{ Ok = $false; Reason = "collection_manifest.json is missing"; Flags = @("qc_manifest_missing") }
+    }
+
+    $tiffs = @(Get-ChildItem -LiteralPath $Dir.FullName -File -Filter "*.tif" -ErrorAction SilentlyContinue)
+    if ($tiffs.Count -ne 1) {
+        return @{ Ok = $false; Reason = "QC folder must contain exactly one TIFF; found $($tiffs.Count)"; Flags = @("qc_tiff_count") }
+    }
+
+    try {
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    } catch {
+        return @{ Ok = $false; Reason = "collection_manifest.json parse error"; Flags = @("qc_manifest_parse_error") }
+    }
+
+    $purpose = [string]$manifest.collection_purpose
+    $isBench2p = ($purpose -in @("bench2p_zstack", "bench2p_fov_qc"))
+    if (($isBench2p -and [string]$manifest.setup_type -ne "bench2p") -or
+        (-not $isBench2p -and [string]$manifest.setup_type -ne "mini2p")) {
+        return @{ Ok = $false; Reason = "Manifest setup_type does not match collection_purpose"; Flags = @("manifest_setup_type") }
+    }
+    if ([string]$manifest.schema_version -ne "2.0") {
+        return @{ Ok = $false; Reason = "QC manifest schema_version is not 2.0"; Flags = @("qc_schema_version") }
+    }
+    if ([string]$manifest.collection_status -ne "finalized" -or
+        [string]::IsNullOrWhiteSpace([string]$manifest.finalized_at)) {
+        return @{ Ok = $false; Reason = "QC manifest has not been finalized"; Flags = @("qc_manifest_not_finalized") }
+    }
+    if ($purpose -notin @("headfixed_fov_qc", "openfield_fov_qc", "bench2p_zstack", "bench2p_fov_qc")) {
+        return @{ Ok = $false; Reason = "QC manifest collection_purpose is invalid"; Flags = @("qc_collection_purpose") }
+    }
+
+    if (-not $isBench2p) {
+        $statusPath = Join-Path $Dir.FullName "external_copy_status.json"
+        if (-not (Test-Path -LiteralPath $statusPath -PathType Leaf)) {
+            return @{ Ok = $false; Reason = "QC external_copy_status.json is missing"; Flags = @("qc_copy_status_missing") }
+        }
+        try {
+            $copyStatus = Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json
+            if ([string]$copyStatus.status -ne "DONE" -or [int]$copyStatus.fail_count -gt 0) {
+                return @{ Ok = $false; Reason = "QC external copy has not completed successfully"; Flags = @("qc_copy_incomplete") }
+            }
+        } catch {
+            return @{ Ok = $false; Reason = "QC external_copy_status.json parse error"; Flags = @("qc_copy_status_parse_error") }
+        }
+    }
+
+    $dataFiles = @(Get-ChildItem -LiteralPath $Dir.FullName -File -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -notin @("collection_manifest.json", "external_copy_status.json")
+    } | Sort-Object Name)
+    $listed = @($manifest.collected_files | Sort-Object name)
+    $inventoryMatches = ($listed.Count -eq $dataFiles.Count)
+    if ($inventoryMatches) {
+        for ($i = 0; $i -lt $dataFiles.Count; $i++) {
+            if ([string]$listed[$i].name -ne $dataFiles[$i].Name -or
+                [int64]$listed[$i].bytes -ne $dataFiles[$i].Length) {
+                $inventoryMatches = $false
+                break
+            }
+        }
+    }
+    if (-not $inventoryMatches) {
+        return @{ Ok = $false; Reason = "QC manifest file inventory does not match session files"; Flags = @("qc_inventory_mismatch") }
+    }
+
+    $videos = @($dataFiles | Where-Object Extension -eq ".mp4")
+    $trackingCsv = @($dataFiles | Where-Object { $_.Name -like "*top_video_timestamps*.csv" })
+    if (-not $isBench2p -and (($videos.Count -gt 0) -xor ($trackingCsv.Count -gt 0))) {
+        return @{ Ok = $false; Reason = "QC tracking video/timestamp pair is incomplete"; Flags = @("qc_tracking_pair") }
+    }
+    if (-not $isBench2p -and $videos.Count -gt 0 -and [string]$manifest.behavior_protocol -ne "openfield_free") {
+        return @{ Ok = $false; Reason = "QC with video must be classified as openfield_free"; Flags = @("qc_behavior_protocol") }
+    }
+    if ($videos.Count -eq 0 -and $null -eq $manifest.motor_position) {
+        return @{ Ok = $false; Reason = "Head-fixed QC manifest is missing motor_position"; Flags = @("qc_motor_position") }
+    }
+
+    $newestWrite = @($tiffs[0].LastWriteTime, (Get-Item -LiteralPath $manifestPath).LastWriteTime) |
+        Sort-Object -Descending | Select-Object -First 1
+    $ageMin = ((Get-Date) - $newestWrite).TotalMinutes
+    if ($ageMin -lt $StableMinutes) {
+        return @{ Ok = $false; Reason = ("not stable yet; newest file age {0:N1} min" -f $ageMin); Flags = @("qc_not_stable") }
+    }
+
+    $codes = @(
+        Get-RosCode $Dir.Name
+        Get-RosCode $tiffs[0].Name
+        Get-RosCode ([string]$manifest.animal_id)
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique
+    if ($StrictAnimalCode -and $codes.Count -gt 1) {
+        return @{ Ok = $false; Reason = "QC animal code mismatch: $($codes -join ', ')"; Flags = @("animal_code_mismatch") }
+    }
+
+    return @{ Ok = $true; Reason = "complete"; Flags = @("qc_manifest_verified") }
+}
+
+function Test-IsQCSession {
+    param([System.IO.DirectoryInfo]$Dir)
+    $manifestPath = Join-Path $Dir.FullName "collection_manifest.json"
+    if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
+        try {
+            $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+            if ([string]$manifest.collection_purpose -in @(
+                "pending_qc_classification", "headfixed_fov_qc", "openfield_fov_qc",
+                "bench2p_zstack", "bench2p_fov_qc")) {
+                return $true
+            }
+        } catch { }
+    }
+
+    if (-not $QcUploadEnabled) { return $false }
+    return ([System.IO.Path]::GetFullPath($Dir.Parent.FullName).TrimEnd('\') -eq
+        [System.IO.Path]::GetFullPath($QcRoot).TrimEnd('\'))
+}
+
 function Invoke-WinSCPUpload {
     param([System.IO.DirectoryInfo]$Dir, [string]$RemoteFolder)
 
@@ -405,6 +527,7 @@ function Invoke-WinSCPUpload {
         "option confirm off",
         $openCommand,
         "option batch continue",
+        "mkdir `"$(Get-RemoteParentPath -Path $RemoteFolder)`"",
         "mkdir `"$RemoteFolder`"",
         "option batch abort",
         "put -resume -nopermissions -nopreservetime -filemask=`"$fileMask`" `"$localMask`" `"$RemoteFolder/`"",
@@ -447,15 +570,32 @@ function Invoke-RcloneUpload {
     if ($LASTEXITCODE -ne 0) { throw "rclone failed with exit code $LASTEXITCODE" }
 }
 
+function Invoke-PreUploadTrackingRepair {
+    $checker = Join-Path $PSScriptRoot "..\..\workers\TrackingRepairWorker\mp4checker.ps1"
+    if (-not (Test-Path -LiteralPath $checker -PathType Leaf)) {
+        Write-Log "WARNING: mp4checker not found; skipping pre-upload tracking repair: $checker"
+        return
+    }
+
+    Write-Log "Running pre-upload tracking repair check."
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $checker -AlertDiscord
+    if ($LASTEXITCODE -ne 0) {
+        Write-Log "WARNING: pre-upload tracking repair exited with code $LASTEXITCODE"
+    }
+}
+
 if (-not (Test-Path $DataRoot)) { throw "DataRoot not found: $DataRoot" }
 
 New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
 $logDir = Join-Path $StateDir "logs"
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+$waitStateDir = Join-Path $StateDir "waiting"
+New-Item -ItemType Directory -Path $waitStateDir -Force | Out-Null
 $script:RunLog = Join-Path $logDir ("upload_completed_sessions_" + (Get-Date -Format "yyyyMMdd") + ".log")
 $script:TransferLog = Join-Path $logDir ("transfer_" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".log")
 
-if ([string]::IsNullOrWhiteSpace($SessionDate)) {
+$ExplicitSessionDate = -not [string]::IsNullOrWhiteSpace($SessionDate)
+if (-not $ExplicitSessionDate) {
     $filterSessionDate = Get-Date -Format "yyyy-MM-dd"
 }
 else {
@@ -464,12 +604,21 @@ else {
 
 Write-Log "Starting upload scan. Method=$Method DataRoot=$DataRoot RemoteRoot=$RemoteRoot OnlySessionDateToday=$OnlySessionDateToday SessionDate=$filterSessionDate DryRun=$DryRun"
 
+if (-not $DryRun) {
+    Invoke-PreUploadTrackingRepair
+} else {
+    Write-Log "DRYRUN skipping pre-upload tracking repair."
+}
+
 $cutoff = (Get-Date).Date.AddDays(-1 * [Math]::Max($SinceDays - 1, 0))
 $dirs = Get-ChildItem -Path $DataRoot -Directory -ErrorAction Stop |
     Where-Object {
         $isSessionFolder = ($_.Name -match '_scan.+_sess')
         if (-not $isSessionFolder) {
             $false
+        }
+        elseif ($ExplicitSessionDate) {
+            $_.Name -match "_$([regex]::Escape($filterSessionDate))_scan"
         }
         elseif ($OnlySessionDateToday) {
             $_.Name -match "_$([regex]::Escape($filterSessionDate))_scan"
@@ -479,6 +628,18 @@ $dirs = Get-ChildItem -Path $DataRoot -Directory -ErrorAction Stop |
         }
     } |
     Sort-Object LastWriteTime
+
+if ($QcUploadEnabled -and (Test-Path -LiteralPath $QcRoot -PathType Container)) {
+    $qcDirs = Get-ChildItem -LiteralPath $QcRoot -Directory -ErrorAction Stop |
+        Where-Object {
+            if ($_.Name -notmatch '_scan.+_sess') { return $false }
+            if ($ExplicitSessionDate -or $OnlySessionDateToday) {
+                return $_.Name -match "_$([regex]::Escape($filterSessionDate))_scan"
+            }
+            return $_.LastWriteTime -ge $cutoff
+        }
+    $dirs = @(@($dirs) + @($qcDirs)) | Sort-Object FullName -Unique | Sort-Object LastWriteTime
+}
 
 $manualReviewDirs = Get-ChildItem -Path $DataRoot -Directory -ErrorAction Stop |
     Where-Object {
@@ -502,18 +663,24 @@ $manualReviewDirs = Get-ChildItem -Path $DataRoot -Directory -ErrorAction Stop |
         }
     }
 
-$dirs = @($dirs + $manualReviewDirs) |
+$dirs = @(@($dirs) + @($manualReviewDirs)) |
     Sort-Object FullName -Unique |
     Sort-Object LastWriteTime
 
 foreach ($dir in $dirs) {
-    $stateFile = Join-Path $StateDir ((ConvertTo-SafeName $dir.Name) + ".uploaded.json")
+    $isQCSession = Test-IsQCSession -Dir $dir
+    $stateName = if ($isQCSession) { "QC_" + $dir.Name } else { $dir.Name }
+    $stateFile = Join-Path $StateDir ((ConvertTo-SafeName $stateName) + ".uploaded.json")
+    $waitStateFile = Join-Path $waitStateDir ((ConvertTo-SafeName $stateName) + ".waiting.json")
     if (Test-Path $stateFile) {
         Write-Log "SKIP already uploaded: $($dir.Name)"
+        if (-not $DryRun -and (Test-Path -LiteralPath $waitStateFile -PathType Leaf)) {
+            Remove-Item -LiteralPath $waitStateFile -Force -ErrorAction SilentlyContinue
+        }
         continue
     }
 
-    $check = Test-SessionComplete -Dir $dir
+    $check = if ($isQCSession) { Test-QCSessionComplete -Dir $dir } else { Test-SessionComplete -Dir $dir }
     if (-not $check.Ok) {
         Write-Log "WAIT $($dir.Name): $($check.Reason)"
 
@@ -532,12 +699,44 @@ foreach ($dir in $dirs) {
         if ($DryRun) {
             Write-Log "DRYRUN would alert Discord: Upload waiting: $($dir.Name)"
         } else {
-            Send-DiscordAlert -Title "Upload waiting: $($dir.Name)" -Message $discordBody
+            $previousWait = $null
+            if (Test-Path -LiteralPath $waitStateFile -PathType Leaf) {
+                try { $previousWait = Get-Content -LiteralPath $waitStateFile -Raw | ConvertFrom-Json } catch { $previousWait = $null }
+            }
+
+            $sameReason = ($null -ne $previousWait -and [string]$previousWait.reason -eq [string]$check.Reason)
+            $todayText = (Get-Date).ToString("yyyy-MM-dd")
+            $lastAlertDate = ""
+            if ($previousWait -and $previousWait.alert_sent_at) {
+                try { $lastAlertDate = ([datetime]::Parse([string]$previousWait.alert_sent_at)).ToString("yyyy-MM-dd") } catch { $lastAlertDate = "" }
+            }
+            $shouldAlert = (-not $sameReason) -or ($lastAlertDate -ne $todayText)
+            if ($shouldAlert) {
+                $title = if ($sameReason) { "Upload still waiting: $($dir.Name)" } else { "Upload waiting: $($dir.Name)" }
+                Send-DiscordAlert -Title $title -Message $discordBody
+            }
+
+            [ordered]@{
+                session = $dir.Name
+                reason = [string]$check.Reason
+                flags = @($check.Flags)
+                first_seen_at = if ($previousWait -and $previousWait.first_seen_at) { [string]$previousWait.first_seen_at } else { (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") }
+                last_seen_at = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                alert_sent_at = if (-not $shouldAlert -and $previousWait.alert_sent_at) { [string]$previousWait.alert_sent_at } else { (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") }
+            } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $waitStateFile -Encoding ASCII
         }
         continue
     }
 
     $remoteFolder = Join-RemotePath $RemoteRoot $dir.Name
+    $hadWaitState = Test-Path -LiteralPath $waitStateFile -PathType Leaf
+    $previousWaitReason = ""
+    if ($hadWaitState) {
+        try {
+            $previousWait = Get-Content -LiteralPath $waitStateFile -Raw | ConvertFrom-Json
+            $previousWaitReason = [string]$previousWait.reason
+        } catch { }
+    }
 
     if ($DryRun) {
         $flagText = if ($check.Flags -and $check.Flags.Count -gt 0) { " flags=" + (($check.Flags) -join ",") } else { "" }
@@ -546,6 +745,11 @@ foreach ($dir in $dirs) {
     }
 
     $flagText = if ($check.Flags -and $check.Flags.Count -gt 0) { " flags=" + (($check.Flags) -join ",") } else { "" }
+    if ($hadWaitState) {
+        Write-Log "RESOLVED wait $($dir.Name): previous error was $previousWaitReason"
+        Remove-Item -LiteralPath $waitStateFile -Force -ErrorAction SilentlyContinue
+    }
+
     Write-Log "UPLOAD $($dir.FullName) -> $remoteFolder$flagText"
     try {
         switch ($Method) {
