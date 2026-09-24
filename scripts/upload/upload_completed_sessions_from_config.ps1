@@ -4,6 +4,7 @@
     [switch]$DryRun
 )
 
+$script:UploadWorkerVersion = "2.1.0"
 $ErrorActionPreference = 'Stop'
 
 . (Join-Path $PSScriptRoot "..\discord\Send-DiscordAlert.ps1")
@@ -81,11 +82,11 @@ function Get-RosCode {
 }
 
 function Add-CodeEvidence {
-    param(
+param(
         [System.Collections.ArrayList]$Evidence,
         [string]$Source,
         [string]$Code
-    )
+)
 
     if (-not [string]::IsNullOrWhiteSpace($Code)) {
         [void]$Evidence.Add([ordered]@{ source = $Source; code = $Code })
@@ -207,6 +208,46 @@ function Test-MissingPatternAllowed {
     return $false
 }
 
+function Test-StandardManifest {
+    param([System.IO.DirectoryInfo]$Dir)
+
+    $manifestPath = Join-Path $Dir.FullName "collection_manifest.json"
+    if (!(Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        return @{ Ok = $false; Reason = "collection_manifest.json is missing"; Flags = @("manifest_missing") }
+    }
+    try {
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    } catch {
+        return @{ Ok = $false; Reason = "collection_manifest.json parse error"; Flags = @("manifest_parse_error") }
+    }
+    if ([string]$manifest.schema_version -ne "2.0") {
+        return @{ Ok = $false; Reason = "manifest schema_version is not 2.0"; Flags = @("manifest_schema_version") }
+    }
+    if ([string]$manifest.collection_status -ne "finalized" -or
+        [string]::IsNullOrWhiteSpace([string]$manifest.finalized_at)) {
+        return @{ Ok = $false; Reason = "manifest has not been finalized"; Flags = @("manifest_not_finalized") }
+    }
+    if ([string]$manifest.collection_purpose -notin @("behavior_training", "behavior_only_experiment", "openfield_experiment")) {
+        return @{ Ok = $false; Reason = "standard manifest collection_purpose is unresolved or invalid"; Flags = @("manifest_collection_purpose") }
+    }
+
+    $dataFiles = @(Get-ChildItem -LiteralPath $Dir.FullName -File -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -notin @("collection_manifest.json", "external_copy_status.json", "external_copy_job.json") -and
+        $_.Name -notlike "external_copy_summary*.txt"
+    } | Sort-Object Name)
+    $listed = @($manifest.collected_files | Sort-Object name)
+    if ($listed.Count -ne $dataFiles.Count) {
+        return @{ Ok = $false; Reason = "manifest file inventory count does not match session files"; Flags = @("manifest_inventory_mismatch") }
+    }
+    for ($i = 0; $i -lt $dataFiles.Count; $i++) {
+        if ([string]$listed[$i].name -ne $dataFiles[$i].Name -or
+            [int64]$listed[$i].bytes -ne $dataFiles[$i].Length) {
+            return @{ Ok = $false; Reason = "manifest file inventory does not match session files"; Flags = @("manifest_inventory_mismatch") }
+        }
+    }
+    return @{ Ok = $true; Reason = "manifest verified"; Flags = @("manifest_verified") }
+}
+
 function Test-SessionComplete {
     param([System.IO.DirectoryInfo]$Dir)
 
@@ -214,6 +255,12 @@ function Test-SessionComplete {
     $statusJson = Join-Path $Dir.FullName "external_copy_status.json"
     $statusData = $null
     $manualReview = $null
+
+    $manifestCheck = Test-StandardManifest -Dir $Dir
+    if (-not $manifestCheck.Ok) {
+        return $manifestCheck
+    }
+    foreach ($flag in @($manifestCheck.Flags)) { $flags.Add([string]$flag) }
 
     if (-not (Test-Path $statusJson)) {
         $flags.Add("status_missing")
@@ -602,7 +649,7 @@ else {
     $filterSessionDate = $SessionDate
 }
 
-Write-Log "Starting upload scan. Method=$Method DataRoot=$DataRoot RemoteRoot=$RemoteRoot OnlySessionDateToday=$OnlySessionDateToday SessionDate=$filterSessionDate DryRun=$DryRun"
+Write-Log "Starting upload scan v$script:UploadWorkerVersion. Method=$Method DataRoot=$DataRoot RemoteRoot=$RemoteRoot OnlySessionDateToday=$OnlySessionDateToday SessionDate=$filterSessionDate DryRun=$DryRun"
 
 if (-not $DryRun) {
     Invoke-PreUploadTrackingRepair
@@ -773,6 +820,7 @@ foreach ($dir in $dirs) {
         remote_path = $remoteFolder
         flags = @($check.Flags)
         uploaded_at = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+        upload_worker_version = $script:UploadWorkerVersion
         source_last_write = $dir.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss")
     } | ConvertTo-Json | Set-Content -Path $stateFile -Encoding ASCII
 

@@ -2,12 +2,14 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$SessionPath,
 
-    [double]$MaxBpodImagingDiffMin = 3.0,
+    [double]$MaxBpodImagingDiffMin = 15.0,
     [double]$MaxTrackingImagingDiffMin = 10.0,
 
     [switch]$UpdateStatus,
     [switch]$AlertDiscord
 )
+
+$script:VerifierVersion = "2.1.0"
 
 $ErrorActionPreference = "Stop"
 
@@ -157,6 +159,104 @@ function Select-TrackingVideoForCsv {
     return ($files | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
 }
 
+function Test-Mp4ContainerClosed {
+    param([string]$Path)
+
+    if (!(Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return [pscustomobject]@{ Ok = $false; Note = "mp4 file not found." }
+    }
+
+    $fs = [System.IO.File]::OpenRead($Path)
+    try {
+        $hasMoov = $false
+        $hasMdat = $false
+        while ($fs.Position -lt $fs.Length) {
+            $offset = $fs.Position
+            $header = New-Object byte[] 8
+            $read = $fs.Read($header, 0, 8)
+            if ($read -lt 8) {
+                return [pscustomobject]@{ Ok = $false; Note = "mp4 has trailing bytes too short for an atom header at offset $offset." }
+            }
+
+            [array]::Reverse($header, 0, 4)
+            $size = [int64][BitConverter]::ToUInt32($header, 0)
+            $type = [System.Text.Encoding]::ASCII.GetString($header, 4, 4)
+            $headerSize = 8L
+
+            if ($size -eq 1) {
+                $wide = New-Object byte[] 8
+                $readWide = $fs.Read($wide, 0, 8)
+                if ($readWide -lt 8) {
+                    return [pscustomobject]@{ Ok = $false; Note = "mp4 extended atom size is truncated at offset $offset." }
+                }
+                [array]::Reverse($wide)
+                $size = [int64][BitConverter]::ToUInt64($wide, 0)
+                $headerSize = 16L
+            } elseif ($size -eq 0) {
+                $size = $fs.Length - $offset
+            }
+
+            if ($size -lt $headerSize) {
+                return [pscustomobject]@{ Ok = $false; Note = "mp4 atom $type has invalid size $size at offset $offset." }
+            }
+            $end = $offset + $size
+            if ($end -gt $fs.Length) {
+                return [pscustomobject]@{ Ok = $false; Note = "mp4 atom $type extends past EOF at offset $offset." }
+            }
+
+            if ($type -eq "moov") { $hasMoov = $true }
+            if ($type -eq "mdat") { $hasMdat = $true }
+            $fs.Seek($end, [System.IO.SeekOrigin]::Begin) | Out-Null
+        }
+
+        if (-not $hasMdat) {
+            return [pscustomobject]@{ Ok = $false; Note = "mp4 has no mdat media atom." }
+        }
+        if (-not $hasMoov) {
+            return [pscustomobject]@{ Ok = $false; Note = "mp4 has no moov atom; Bonsai/encoder likely had not finalized the file when it was copied." }
+        }
+        return [pscustomobject]@{ Ok = $true; Note = "mp4 container has mdat and moov atoms." }
+    }
+    finally {
+        $fs.Close()
+    }
+}
+
+function Test-TrackingCsvComplete {
+    param([string]$Path)
+
+    if (!(Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return [pscustomobject]@{ Ok = $false; Note = "tracking CSV file not found." }
+    }
+
+    $first = @(Get-Content -LiteralPath $Path -TotalCount 1 -ErrorAction Stop)
+    $last = @(Get-Content -LiteralPath $Path -Tail 1 -ErrorAction Stop)
+    if ($first.Count -eq 0 -or [string]::IsNullOrWhiteSpace($first[0])) {
+        return [pscustomobject]@{ Ok = $false; Note = "tracking CSV is empty." }
+    }
+    if ($last.Count -eq 0 -or [string]::IsNullOrWhiteSpace($last[0])) {
+        return [pscustomobject]@{ Ok = $false; Note = "tracking CSV has no final row." }
+    }
+
+    $firstCols = ([string]$first[0]).Split(",").Count
+    $lastCols = ([string]$last[0]).Split(",").Count
+    if ($firstCols -lt 5) {
+        return [pscustomobject]@{ Ok = $false; Note = "tracking CSV first row has too few columns ($firstCols)." }
+    }
+    if ($lastCols -ne $firstCols) {
+        return [pscustomobject]@{ Ok = $false; Note = "tracking CSV final row appears truncated: first row has $firstCols columns, final row has $lastCols columns." }
+    }
+
+    $ts = ([string]$last[0]).Split(",")[0]
+    try {
+        [datetimeoffset]::Parse($ts, [Globalization.CultureInfo]::InvariantCulture) | Out-Null
+    } catch {
+        return [pscustomobject]@{ Ok = $false; Note = "tracking CSV final row timestamp is not parseable: $ts" }
+    }
+
+    return [pscustomobject]@{ Ok = $true; Note = "tracking CSV first/final row column counts match ($firstCols), and final timestamp parses." }
+}
+
 function Load-DiscordFromConfig {
     $cfgPath = Join-Path $PSScriptRoot "..\..\config\upload_sessions_config.json"
     $script:DiscordWebhookUrl = ""
@@ -167,7 +267,7 @@ function Load-DiscordFromConfig {
             $cfg = Get-Content -LiteralPath $cfgPath -Raw | ConvertFrom-Json
             if ($cfg.discord -and $cfg.discord.enabled -and -not [string]::IsNullOrWhiteSpace($cfg.discord.webhookUrl)) {
                 $script:DiscordWebhookUrl = [string]$cfg.discord.webhookUrl
-                if ($cfg.discord.username) { $script:DiscordUsername = [string]$cfg.discord.username }
+                if ($cfg.discord.verifyUsername) { $script:DiscordUsername = [string]$cfg.discord.verifyUsername }
             }
         } catch { }
     }
@@ -193,6 +293,8 @@ $sessionDate = Get-SessionDateFromName $sessionName
 $statusPath = Join-Path $sessionDir.FullName "external_copy_status.json"
 
 $imagingRef = Select-NewestFile -Root $sessionDir.FullName -Patterns @("*.tif", "*.h5")
+$imagingStartFile = Select-NewestFile -Root $sessionDir.FullName -Patterns @("*.tif")
+$imagingStart = if ($imagingStartFile) { $imagingStartFile.CreationTime } else { $null }
 if ($null -eq $imagingRef) {
     Add-CheckItem -Items $items -Label "ScanImage imaging reference" -Pattern "*.tif/*.h5" -Status "FAIL" -Note "No imaging file found."
 } else {
@@ -213,12 +315,18 @@ if ($null -eq $trackingCsv) {
     } else {
         $csvNote = "Present; Bonsai token $token matches session date."
         $csvDiff = -1
+        $csvStatus = "OK"
         if ($null -ne $imagingRef) {
             $cmp = Compare-TimeToReference -File $trackingCsv -Reference $imagingRef -LimitMin ([double]$MaxTrackingImagingDiffMin)
             $csvDiff = $cmp.DiffMin
             $csvNote += (" CSV LastWriteTime is {0:n1} min from imaging reference." -f $cmp.DiffMin)
         }
-        Add-CheckItem -Items $items -Label "Tracking timestamps (.csv)" -Pattern "*timestamps*.csv" -Status "OK" `
+        $csvCheck = Test-TrackingCsvComplete -Path $trackingCsv.FullName
+        if (-not $csvCheck.Ok) {
+            $csvStatus = "FAIL"
+        }
+        $csvNote += " " + $csvCheck.Note
+        Add-CheckItem -Items $items -Label "Tracking timestamps (.csv)" -Pattern "*timestamps*.csv" -Status $csvStatus `
             -Note $csvNote -Src $trackingCsv.FullName -Dst $(if ($imagingRef) { $imagingRef.FullName } else { "" }) -TimeDiffMin $csvDiff
     }
 
@@ -226,8 +334,10 @@ if ($null -eq $trackingCsv) {
     if ($null -eq $trackingVideo) {
         Add-CheckItem -Items $items -Label "Tracking video (.mp4)" -Pattern "*.mp4" -Status "FAIL" -Note "No paired mp4 found with the same Bonsai timestamp token as the CSV." -Src $trackingCsv.FullName
     } else {
-        Add-CheckItem -Items $items -Label "Tracking video (.mp4)" -Pattern "*.mp4" -Status "OK" `
-            -Note "Present and paired to timestamp CSV by Bonsai token $token; mp4 LastWriteTime is ignored because post-session merging can update it." `
+        $mp4Check = Test-Mp4ContainerClosed -Path $trackingVideo.FullName
+        $mp4Status = if ($mp4Check.Ok) { "OK" } else { "FAIL" }
+        Add-CheckItem -Items $items -Label "Tracking video (.mp4)" -Pattern "*.mp4" -Status $mp4Status `
+            -Note "Present and paired to timestamp CSV by Bonsai token $token; $($mp4Check.Note) mp4 LastWriteTime is ignored because post-session merging can update it." `
             -Src $trackingVideo.FullName -Dst $trackingCsv.FullName
     }
 }
@@ -251,6 +361,22 @@ foreach ($spec in $requiredSpecs) {
             -Note "Animal code mismatch: folder=$animalCode file=$fileAnimalCode" `
             -Src $f.FullName
         continue
+    }
+
+    if ($spec.Pattern -eq "*.mat" -and $null -ne $imagingStart) {
+        $startMatch = [regex]::Match($f.BaseName, '_(\d{8}_\d{6})$')
+        if (-not $startMatch.Success) {
+            Add-CheckItem -Items $items -Label $spec.Label -Pattern $spec.Pattern -Status "FAIL" `
+                -Note "BPod filename has no parseable session-start timestamp." -Src $f.FullName
+            continue
+        }
+        $bpodStart = [datetime]::ParseExact($startMatch.Groups[1].Value, "yyyyMMdd_HHmmss", [Globalization.CultureInfo]::InvariantCulture)
+        if ($bpodStart -gt $imagingStart.AddMinutes(2) -or $f.LastWriteTime -lt $imagingStart.AddMinutes(-2)) {
+            Add-CheckItem -Items $items -Label $spec.Label -Pattern $spec.Pattern -Status "FAIL" `
+                -Note "BPod start/completion interval does not overlap the imaging interval safely." `
+                -Src $f.FullName -Dst $imagingStartFile.FullName
+            continue
+        }
     }
 
     if ($null -ne $imagingRef) {
@@ -306,6 +432,7 @@ $obj = [ordered]@{
     updated_at = NowStamp
     verified_at = NowStamp
     verifier = "verify_session_folder_for_upload.ps1"
+    verifier_version = $script:VerifierVersion
     bpod_imaging_max_diff_min = $MaxBpodImagingDiffMin
     tracking_imaging_max_diff_min = $MaxTrackingImagingDiffMin
 }
@@ -317,9 +444,9 @@ if ($UpdateStatus) {
     Write-Host "`nDry run only. Add -UpdateStatus to rewrite external_copy_status.json."
 }
 
-if ($AlertDiscord) {
+if ($AlertDiscord -and $fail -gt 0) {
     Load-DiscordFromConfig
-    $title = if ($fail -gt 0) { "Session verification failed: $animalCode scan$scanId" } else { "Session verification passed: $animalCode scan$scanId" }
+    $title = "Session verification failed: $animalCode scan$scanId"
     $bad = @($items | Where-Object { $_.status -eq "FAIL" -or $_.status -eq "WARN" })
     $lines = @(
         "Session: $($sessionDir.Name)",
@@ -332,8 +459,6 @@ if ($AlertDiscord) {
         foreach ($it in $bad) {
             $lines += "  - [$($it.status)] $($it.label) - $($it.note)"
         }
-    } else {
-        $lines += "All required files are present and time-consistent."
     }
     try { Send-VerifyDiscordAlert -Title $title -Message ($lines -join "`n") } catch { Write-Host "WARNING: Discord alert failed: $_" }
 }

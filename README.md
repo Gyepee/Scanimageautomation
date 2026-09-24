@@ -6,6 +6,10 @@ copying, upload gating, and Discord notifications.
 This repository intentionally tracks only reusable code and templates. Runtime
 state, logs, machine-specific configs, and backups are ignored by git.
 
+For the current end-to-end design, component versions, three consolidation
+choices, manifest rules, file naming, CopyWorker matching, and upload gates,
+see `WORKFLOW_GUIDE.md`. Legacy recovery commands remain in `OPERATIONS.md`.
+
 ## Active Automations
 
 - `ScanImageCompletedSessionUpload`

@@ -2,10 +2,13 @@
   "method": "winscp",
   "dataRoot": "F:\\Data\\jisooj",
   "remoteRoot": "/data/jisooj",
+  "qcUploadEnabled": true,
+  "qcRoot": "F:\\Data\\jisooj\\QC",
+  "qcRemoteSubdir": "QC",
   "stateDir": "C:\\Users\\ScanImage\\Documents\\ScanImageAutomation\\state\\upload_state",
   "stableMinutes": 10,
-  "sinceDays": 1,
-  "onlySessionDateToday": true,
+  "sinceDays": 5,
+  "onlySessionDateToday": false,
   "allowWarnings": true,
   "requireBPod": false,
   "requireCopyStatus": true,
@@ -18,7 +21,11 @@
   "discord": {
     "enabled": false,
     "webhookUrl": "",
-    "username": "ScanImage Upload Bot"
+    "username": "ScanImage Upload Bot",
+    "copyUsername": "ScanImage Copy Bot",
+    "repairUsername": "ScanImage Repair Bot",
+    "verifyUsername": "ScanImage Verify Bot",
+    "uploadUsername": "ScanImage Upload Bot"
   },
   "winscp": {
     "path": "C:\\Program Files (x86)\\WinSCP\\WinSCP.com",

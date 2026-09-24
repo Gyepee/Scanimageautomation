@@ -6,6 +6,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $script:Job = $null
+$script:CopyWorkerVersion = "2.1.0"
 
 function NowStamp {
     return (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff")
@@ -26,6 +27,7 @@ function Write-Status {
     $j = $script:Job
     $obj = [ordered]@{
         status            = $Status
+        worker_version    = $script:CopyWorkerVersion
         message           = $Message
         session_timestamp = if ($j) { [string]$j.session_timestamp } else { "" }
         animal_label      = if ($j) { [string]$j.animalID } else { "" }
@@ -185,6 +187,33 @@ function Get-ReferenceImagingFile {
     }
 
     return ($imagingFiles | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+}
+
+function Get-ImagingTimeWindow {
+    param([string]$Dest, [datetime]$FallbackTime)
+
+    $files = @(Get-ChildItem -LiteralPath $Dest -File -ErrorAction SilentlyContinue | Where-Object {
+        $_.Extension -in @(".tif", ".h5")
+    })
+    if ($files.Count -eq 0) {
+        return [pscustomobject]@{
+            Files = @()
+            Start = $FallbackTime
+            End = $FallbackTime
+            Reference = $null
+            UsedFallback = $true
+        }
+    }
+
+    $newestTiff = @($files | Where-Object Extension -eq ".tif" | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+    $startFile = if ($newestTiff.Count -gt 0) { $newestTiff[0] } else { $files | Sort-Object CreationTime -Descending | Select-Object -First 1 }
+    return [pscustomobject]@{
+        Files = $files
+        Start = $startFile.CreationTime
+        End = ($files | Sort-Object LastWriteTime -Descending | Select-Object -First 1).LastWriteTime
+        Reference = ($files | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+        UsedFallback = $false
+    }
 }
 
 function Test-BpodMatAgainstImagingTime {
@@ -427,17 +456,46 @@ function Select-TrackingPair {
         [double]$MaxDiffMin = 30.0
     )
 
-    $csvSel = Select-SameDayClosest -Root $Root -Pattern "mini2p2_top_video_timestamps*.csv" -SessionTime $SessionTime
-    if ($null -eq $csvSel.File) {
+    if (!(Test-Path -LiteralPath $Root -PathType Container)) {
         return [pscustomobject]@{
             Video = $null
             Csv = $null
             Token = ""
-            Detail = $csvSel.Detail
+            Detail = "folder not accessible: $Root"
         }
     }
 
-    $csvDiffMin = [math]::Abs(($csvSel.File.LastWriteTime - $SessionTime).TotalMinutes)
+    $candidates = @()
+    $csvFiles = @(Get-ChildItem -LiteralPath $Root -Filter "mini2p2_top_video_timestamps*.csv" -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Length -gt 0 -and $_.LastWriteTime.Date -eq $SessionTime.Date })
+    foreach ($csv in $csvFiles) {
+        $token = Get-BonsaiToken $csv.Name
+        if ([string]::IsNullOrWhiteSpace($token)) { continue }
+        try {
+            $startTime = [datetime]::ParseExact($token, "yyyy-MM-ddTHH_mm_ss", [Globalization.CultureInfo]::InvariantCulture)
+        } catch { continue }
+        if ($startTime -gt $SessionTime.AddMinutes(2)) { continue }
+
+        $videos = @(Get-ChildItem -LiteralPath $Root -Filter "mini2p2_top_video*.mp4" -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Length -gt 0 -and $_.Name -like "*$token*" })
+        if ($videos.Count -eq 0) { continue }
+
+        $video = $videos | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        $diff = [math]::Abs(($csv.LastWriteTime - $SessionTime).TotalMinutes)
+        $candidates += [pscustomobject]@{ Csv = $csv; Video = $video; Token = $token; DiffMin = $diff; Start = $startTime }
+    }
+
+    if ($candidates.Count -eq 0) {
+        return [pscustomobject]@{
+            Video = $null
+            Csv = $null
+            Token = ""
+            Detail = "no non-empty, paired Bonsai mp4/CSV candidate started before the imaging end time"
+        }
+    }
+
+    $best = $candidates | Sort-Object @{ Expression = { $_.DiffMin }; Ascending = $true }, @{ Expression = { $_.Start }; Descending = $true } | Select-Object -First 1
+    $csvDiffMin = $best.DiffMin
     if ($csvDiffMin -gt $MaxDiffMin) {
         return [pscustomobject]@{
             Video = $null
@@ -447,34 +505,11 @@ function Select-TrackingPair {
         }
     }
 
-    $token = Get-BonsaiToken $csvSel.File.Name
-    if ([string]::IsNullOrWhiteSpace($token)) {
-        return [pscustomobject]@{
-            Video = $null
-            Csv = $csvSel.File
-            Token = ""
-            Detail = "timestamp CSV selected, but no Bonsai timestamp token was found in its filename"
-        }
-    }
-
-    $videos = @(Get-ChildItem -LiteralPath $Root -Filter "mini2p2_top_video*.mp4" -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -like "*$token*" })
-
-    if ($videos.Count -eq 0) {
-        return [pscustomobject]@{
-            Video = $null
-            Csv = $csvSel.File
-            Token = $token
-            Detail = "timestamp CSV selected, but no paired mp4 with Bonsai token $token was found"
-        }
-    }
-
-    $video = $videos | Sort-Object LastWriteTime -Descending | Select-Object -First 1
     return [pscustomobject]@{
-        Video = $video
-        Csv = $csvSel.File
-        Token = $token
-        Detail = "selected paired Bonsai tracking files by timestamp token $token"
+        Video = $best.Video
+        Csv = $best.Csv
+        Token = $best.Token
+        Detail = ("selected non-empty paired Bonsai files by imaging-end time; token {0}, |dt|={1:n1} min" -f $best.Token, $best.DiffMin)
     }
 }
 
@@ -554,6 +589,66 @@ function Select-BpodSessionFolder {
         Folder = $best.Folder
         Detail = ("latest file time {0}, |dt|={1:n1} min" -f $best.LatestTime, $best.DiffMin)
         DiffMin = $best.DiffMin
+    }
+}
+
+function Select-BpodMatCandidate {
+    param(
+        [string]$AnimalFolder,
+        [datetime]$ImagingStart,
+        [datetime]$ImagingEnd,
+        [double]$MaxDiffMin,
+        [double]$FutureStartToleranceMin = 2.0
+    )
+
+    $sessionDirs = @(Get-ChildItem -LiteralPath $AnimalFolder -Recurse -Directory -Filter "Session Data" -ErrorAction SilentlyContinue)
+    $candidates = @()
+    foreach ($dir in $sessionDirs) {
+        $mats = @(Get-ChildItem -LiteralPath $dir.FullName -Filter "*.mat" -File -ErrorAction SilentlyContinue)
+        foreach ($mat in $mats) {
+            $match = [regex]::Match($mat.BaseName, '_(\d{8}_\d{6})$')
+            if (-not $match.Success) { continue }
+            try {
+                $start = [datetime]::ParseExact($match.Groups[1].Value, "yyyyMMdd_HHmmss", [Globalization.CultureInfo]::InvariantCulture)
+            } catch { continue }
+            if ($start.Date -ne $ImagingEnd.Date) { continue }
+            if ($start -gt $ImagingStart.AddMinutes($FutureStartToleranceMin)) { continue }
+            if ($mat.LastWriteTime -lt $ImagingStart.AddMinutes(-2)) { continue }
+
+            $diff = [math]::Abs(($mat.LastWriteTime - $ImagingEnd).TotalMinutes)
+            $candidates += [pscustomobject]@{
+                Folder = $dir
+                Mat = $mat
+                Start = $start
+                DiffMin = $diff
+            }
+        }
+    }
+
+    if ($candidates.Count -eq 0) {
+        return [pscustomobject]@{
+            Folder = $null
+            Mat = $null
+            DiffMin = [double]::PositiveInfinity
+            Detail = "no same-day BPod .mat candidate overlaps the imaging interval and starts no later than 2 min after imaging start"
+        }
+    }
+
+    $best = $candidates | Sort-Object @{ Expression = { $_.DiffMin }; Ascending = $true }, @{ Expression = { $_.Start }; Descending = $true } | Select-Object -First 1
+    if ($best.DiffMin -gt $MaxDiffMin) {
+        return [pscustomobject]@{
+            Folder = $null
+            Mat = $best.Mat
+            DiffMin = $best.DiffMin
+            Detail = ("closest eligible BPod .mat is {0:n1} min from imaging end; limit is {1:n1} min" -f $best.DiffMin, $MaxDiffMin)
+        }
+    }
+
+    return [pscustomobject]@{
+        Folder = $best.Folder
+        Mat = $best.Mat
+        DiffMin = $best.DiffMin
+        Detail = ("selected individual BPod .mat by imaging-end time; |dt|={0:n1} min" -f $best.DiffMin)
     }
 }
 
@@ -663,8 +758,13 @@ function Set-StandardManifestClassification {
         if ($BehaviorType -match "Training") {
             $manifest.collection_purpose = "behavior_training"
             $manifest.PSObject.Properties.Remove("utlens_z")
-        } elseif ($hasPower) {
-            $manifest.collection_purpose = "openfield_experiment"
+        } elseif ($BehaviorType -match "Experiment") {
+            if ($hasPower) {
+                $manifest.collection_purpose = "openfield_experiment"
+            } else {
+                $manifest.collection_purpose = "behavior_only_experiment"
+                $manifest.PSObject.Properties.Remove("utlens_z")
+            }
         } else {
             $manifest.collection_purpose = "behavior_training"
             $manifest.PSObject.Properties.Remove("utlens_z")
@@ -693,7 +793,7 @@ try {
     $dest = [string]$job.data_path
     $exp = [string]$job.experimentID
     $timeDiffWarnMin = if ($null -ne $job.timeDiffWarnMin) { [double]$job.timeDiffWarnMin } else { 5.0 }
-    $bpodImagingMaxDiffMin = if ($null -ne $job.bpodImagingMaxDiffMin) { [double]$job.bpodImagingMaxDiffMin } else { 3.0 }
+    $bpodImagingMaxDiffMin = if ($null -ne $job.bpodImagingMaxDiffMin) { [double]$job.bpodImagingMaxDiffMin } else { 15.0 }
     $isFovQc = ([string]$job.collection_mode -eq "fov_qc")
 
     $jobAnimalCode = [string]$job.animalCode
@@ -713,7 +813,27 @@ try {
         if ($pathAnimalLabel -ne "") { $job.animalID = $pathAnimalLabel }
     }
 
-    $trackingPair = Select-TrackingPair -Root $job.tracking_root -SessionTime $sessionTime -MaxDiffMin 30.0
+    $imagingWindow = Get-ImagingTimeWindow -Dest $dest -FallbackTime $sessionTime
+    $matchingTime = $imagingWindow.End
+    if ($imagingWindow.UsedFallback) {
+        Add-Item -Label "Imaging time anchor" -Pattern "*.tif/*.h5" -Status "FAIL" `
+            -Note "No TIFF/H5 was present; external files cannot be matched safely from the consolidation time alone."
+    } else {
+        Add-Item -Label "Imaging time anchor" -Pattern "*.tif/*.h5" -Status "OK" `
+            -Note ("Using captured imaging file times: start {0}, end {1}. Consolidation time is ignored." -f $imagingWindow.Start, $imagingWindow.End) `
+            -Src $imagingWindow.Reference.FullName
+    }
+
+    if ($imagingWindow.UsedFallback) {
+        $trackingPair = [pscustomobject]@{
+            Video = $null
+            Csv = $null
+            Token = ""
+            Detail = "tracking selection skipped because no TIFF/H5 imaging-time anchor exists"
+        }
+    } else {
+        $trackingPair = Select-TrackingPair -Root $job.tracking_root -SessionTime $matchingTime -MaxDiffMin 30.0
+    }
     if ($null -eq $trackingPair.Csv) {
         $missingTrackingStatus = if ($isFovQc) { "SKIP" } else { "FAIL" }
         Add-Item -Label "Tracking timestamps (.csv)" -Pattern "mini2p2_top_video_timestamps*.csv" -Status $missingTrackingStatus -Note $trackingPair.Detail
@@ -776,16 +896,19 @@ try {
     $animalCode = $jobAnimalCode
     if (-not $isFovQc) {
     $animalFolder = Find-BpodAnimalFolder -BpodRoot $job.bpod_root -AnimalCode $animalCode
-    if ($null -eq $animalFolder) {
+    if ($imagingWindow.UsedFallback) {
+        Add-Item -Label "BPod session files" -Pattern "*.mat/*.txt/*.csv" -Status "FAIL" -Note "BPod selection skipped because no TIFF/H5 imaging-time anchor exists."
+    } elseif ($null -eq $animalFolder) {
         Add-Item -Label "BPod session files" -Pattern "*.mat/*.txt/*.csv" -Status "FAIL" -Note "No BPod animal folder matched core animal code $animalCode"
     } else {
-        $bpodSel = Select-BpodSessionFolder -AnimalFolder $animalFolder.FullName -SessionTime $sessionTime
+        $bpodSel = Select-BpodMatCandidate -AnimalFolder $animalFolder.FullName `
+            -ImagingStart $imagingWindow.Start -ImagingEnd $matchingTime `
+            -MaxDiffMin $bpodImagingMaxDiffMin
         if ($null -eq $bpodSel.Folder) {
-            Add-Item -Label "BPod session files" -Pattern "Session Data" -Status "FAIL" -Note $bpodSel.Detail
-        } elseif ($bpodSel.DiffMin -gt [double]$job.bpodMaxDiffMin) {
-            Add-Item -Label "BPod session files" -Pattern "Session Data" -Status "FAIL" -Note ("Closest BPod data too far from session time: {0:n1} min, limit {1:n1} min. Manual copy required." -f $bpodSel.DiffMin, [double]$job.bpodMaxDiffMin) -Src $bpodSel.Folder.FullName
+            $candidatePath = if ($bpodSel.Mat) { $bpodSel.Mat.FullName } else { "" }
+            Add-Item -Label "BPod session files" -Pattern "Session Data" -Status "FAIL" -Note $bpodSel.Detail -Src $candidatePath
         } else {
-            $bpodMatSel = Select-SameDayClosest -Root $bpodSel.Folder.FullName -Pattern "*.mat" -SessionTime $sessionTime
+            $bpodMatSel = [pscustomobject]@{ File = $bpodSel.Mat; Detail = $bpodSel.Detail }
             $bpodTimingOk = $false
 
             if ($null -eq $bpodMatSel.File) {
@@ -838,16 +961,16 @@ try {
                 if ($spec.Pattern -eq "*.mat") {
                     $sel = $bpodMatSel
                 } elseif ($spec.Pattern -eq "*SessionSummary.txt") {
-                    $sel = Select-BpodCompanion -Root $bpodSel.Folder.FullName -MatFile $bpodMatSel.File -Suffix "_SessionSummary.txt" -FallbackPattern $spec.Pattern -SessionTime $sessionTime
+                    $sel = Select-BpodCompanion -Root $bpodSel.Folder.FullName -MatFile $bpodMatSel.File -Suffix "_SessionSummary.txt" -FallbackPattern $spec.Pattern -SessionTime $matchingTime
                 } else {
-                    $sel = Select-BpodCompanion -Root $bpodSel.Folder.FullName -MatFile $bpodMatSel.File -Suffix "_SessionSummary.csv" -FallbackPattern $spec.Pattern -SessionTime $sessionTime
+                    $sel = Select-BpodCompanion -Root $bpodSel.Folder.FullName -MatFile $bpodMatSel.File -Suffix "_SessionSummary.csv" -FallbackPattern $spec.Pattern -SessionTime $matchingTime
                 }
                 if ($null -eq $sel.File) {
                     Add-Item -Label $spec.Label -Pattern $spec.Pattern -Status "FAIL" -Note $sel.Detail
                     continue
                 }
                 $dst = Copy-WithPrefix -File $sel.File -ExperimentID $exp -Dest $dest
-                $tDiff = [math]::Abs(($sel.File.LastWriteTime - $sessionTime).TotalMinutes)
+                $tDiff = [math]::Abs(($sel.File.LastWriteTime - $matchingTime).TotalMinutes)
                 if ($tDiff -gt $timeDiffWarnMin) {
                     Add-Item -Label $spec.Label -Pattern $spec.Pattern -Status "WARN" `
                         -Note ("{0}; {1:n1} min from session time - review required" -f $sel.Detail, $tDiff) `
